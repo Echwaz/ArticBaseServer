@@ -58,7 +58,7 @@ Result AMAPP_GetDLCTitleInfos(FS_MediaType mediatype, u32 titleCount, u64 *title
 	return (Result)cmdbuf[1];
 }
 
-Result AMAPP_ListDataTitleTicketInfos(u32* ticketReadCount, u64 titleID, u32 ticketInfoCount, u32 offset, AM_TicketInfo* ticketInfos)
+Result AMAPP_ListDataTitleTicketInfos(u32* ticketReadCount, u64 titleID, u32 ticketInfoCount, u32 offset, ArticTicketInfo* ticketInfos)
 {
 	Result ret = 0;
 	u32 *cmdbuf = getThreadCommandBuffer();
@@ -68,7 +68,7 @@ Result AMAPP_ListDataTitleTicketInfos(u32* ticketReadCount, u64 titleID, u32 tic
 	cmdbuf[2] = titleID & 0xffffffff;
 	cmdbuf[3] = (u32)(titleID >> 32);
 	cmdbuf[4] = offset;
-	cmdbuf[5] = IPC_Desc_Buffer(ticketInfoCount * sizeof(AM_TicketInfo), IPC_BUFFER_W);
+	cmdbuf[5] = IPC_Desc_Buffer(ticketInfoCount * sizeof(ArticTicketInfo), IPC_BUFFER_W);
 	cmdbuf[6] = (u32)ticketInfos;
 
 	if(R_FAILED(ret = svcSendSyncRequest(*amGetSessionHandle()))) return ret;

@@ -177,11 +177,13 @@ PrintConsole topScreenConsole, bottomScreenConsole;
 void Main() {
     logger.Start();
 
+#ifndef ARTIC_STANDALONE
     plgLdrInit();
     bool prevPluginState = ((PluginHeader*)0x07000000)->config[0] != 0;
     PLGLDR__SetPluginLoaderState(prevPluginState);
     PLGLDR__ClearPluginLoadParameters();
     plgLdrExit();
+#endif
 
     gspLcdInit();
 
@@ -255,7 +257,9 @@ void Main() {
     CTRPluginFramework::Clock clock;
     bool sleeping = false;
     
+#ifndef ARTIC_STANDALONE
     DisableSleep();
+#endif
     
     while (aptMainLoop())
 	{
@@ -356,7 +360,9 @@ void Main() {
         threadFree(serverThread);
     }
 
+#ifndef ARTIC_STANDALONE
     EnableSleep();
+#endif
 
     // Flush and swap framebuffers
     gfxFlushBuffers();

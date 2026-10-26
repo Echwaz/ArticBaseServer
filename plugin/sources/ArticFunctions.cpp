@@ -10,6 +10,8 @@
 #include "amExtension.hpp"
 #include "fsExtension.hpp"
 #include "hidExtension.hpp"
+#include "loaderCustom.hpp"
+#include "pxiRomFS.hpp"
 #include "CTRPluginFramework/CTRPluginFramework.hpp"
 #include "CTRPluginFramework/Clock.hpp"
 
@@ -21,6 +23,219 @@ namespace ArticFunctions {
     std::map<u64, HandleType> openHandles;
     CTRPluginFramework::Mutex amMutex;
     CTRPluginFramework::Mutex cfgMutex;
+    CTRPluginFramework::Mutex loaderMutex;
+
+    static u8* largeCode = nullptr;
+    static u32 largeCodeSize = 0;
+    static u64 largeCodeTitle = 0;
+    static u8 largeCodeMedia = 0;
+
+    static void ClearLargeCode() {
+        free(largeCode);
+        largeCode = nullptr;
+        largeCodeSize = 0;
+    }
+
+    void Title_ReadCodeChunk(ArticProtocolServer::MethodInterface& mi) {
+        s64 title;
+        s8 media;
+        s32 total, offset, amount;
+        if (!mi.GetParameterS64(title) || !mi.GetParameterS8(media) ||
+            !mi.GetParameterS32(total) || !mi.GetParameterS32(offset) ||
+            !mi.GetParameterS32(amount) || !mi.FinishInputParameters()) return;
+        const u32 category = static_cast<u64>(title) >> 32;
+        if (media < 0 || media > 2 || total <= 0 || total > 16 * 1024 * 1024 ||
+            offset < 0 || offset >= total || amount <= 0 || amount > 1024 * 1024 ||
+            amount > total - offset || (category != 0x40000 && category != 0x40010 && category != 0x40030)) {
+            mi.FinishInternalError(); return;
+        }
+        CTRPluginFramework::Lock lock(loaderMutex);
+        if (offset == 0) {
+            ClearLargeCode();
+            largeCode = static_cast<u8*>(malloc(total));
+            if (!largeCode) { mi.FinishInternalError(); return; }
+            u32 read = 0;
+            const Result res = LOADER_ReadTitleCode(largeCode, total, &read, title, media);
+            if (R_FAILED(res) || read != static_cast<u32>(total)) {
+                ClearLargeCode(); mi.FinishGood(R_FAILED(res) ? res : static_cast<Result>(-1)); return;
+            }
+            largeCodeTitle = title;
+            largeCodeMedia = media;
+            largeCodeSize = read;
+        }
+        if (!largeCode || largeCodeTitle != static_cast<u64>(title) || largeCodeMedia != media ||
+            largeCodeSize != static_cast<u32>(total)) { mi.FinishInternalError(); return; }
+        auto* buffer = mi.ReserveResultBuffer(0, amount);
+        if (!buffer) { ClearLargeCode(); return; }
+        memcpy(buffer->data, largeCode + offset, amount);
+        if (offset + amount == total) ClearLargeCode();
+        mi.FinishGood(0);
+    }
+
+    void Title_GetCodeSize(ArticProtocolServer::MethodInterface& mi) {
+        s64 title; s8 media;
+        if (!mi.GetParameterS64(title) || !mi.GetParameterS8(media) || !mi.FinishInputParameters()) return;
+        const u32 category = static_cast<u64>(title) >> 32;
+        if (media < 0 || media > 2 || (category != 0x40000 && category != 0x40010 && category != 0x40030)) {
+            mi.FinishInternalError(); return;
+        }
+        CTRPluginFramework::Lock lock(loaderMutex);
+        u64 size = 0;
+        const Result res = LOADER_GetTitleCodeSize(&size, title, media);
+        auto* buffer = mi.ReserveResultBuffer(0, sizeof(size));
+        if (!buffer) return;
+        memcpy(buffer->data, &size, sizeof(size));
+        mi.FinishGood(res);
+    }
+
+    void Title_ReadCode(ArticProtocolServer::MethodInterface& mi) {
+        s64 title;
+        s8 media;
+        s32 capacity;
+        if (!mi.GetParameterS64(title) || !mi.GetParameterS8(media) ||
+            !mi.GetParameterS32(capacity) || !mi.FinishInputParameters()) return;
+        const u32 category = static_cast<u64>(title) >> 32;
+        if (media < 0 || media > 2 || capacity <= 0 || capacity > 4 * 1024 * 1024 ||
+            (category != 0x00040000 && category != 0x00040010 && category != 0x00040030)) {
+            mi.FinishInternalError();
+            return;
+        }
+        auto* buffer = mi.ReserveResultBuffer(0, capacity);
+        if (!buffer) return;
+        u32 read = 0;
+        CTRPluginFramework::Lock lock(loaderMutex);
+        const Result res = LOADER_ReadTitleCode(buffer->data, capacity, &read,
+                                                static_cast<u64>(title), static_cast<u8>(media));
+        mi.ResizeLastResultBuffer(buffer, R_SUCCEEDED(res) ? read : 0);
+        mi.FinishGood(res);
+    }
+
+    void Title_ReadHomeLayout(ArticProtocolServer::MethodInterface& mi) {
+        if (!mi.FinishInputParameters()) return;
+        auto* buffer = mi.ReserveResultBuffer(0, 0x2558);
+        if (!buffer) return;
+        u32 stage = 0;
+        CTRPluginFramework::Lock lock(loaderMutex);
+        const Result res = ReadPxiHomeLayout(buffer->data, 0x2558, &stage);
+        mi.ResizeLastResultBuffer(buffer, R_SUCCEEDED(res) ? 0x2558 : 0);
+        auto* report = mi.ReserveResultBuffer(1, sizeof(stage));
+        if (!report) return;
+        memcpy(report->data, &stage, sizeof(stage));
+        mi.FinishGood(res);
+    }
+
+    static void ReadTitleRomFS(ArticProtocolServer::MethodInterface& mi,
+                              u64 titleId, u8 media, s64 offset, s32 size, bool update = false) {
+        if (offset < 0 || size <= 0 || size > 256 * 1024) {
+            mi.FinishInternalError();
+            return;
+        }
+        auto* buffer = mi.ReserveResultBuffer(0, size);
+        if (!buffer) return;
+        u32 read = 0;
+        u64 fileSize = 0;
+        CTRPluginFramework::Lock lock(loaderMutex);
+        Result res = LOADER_ReadTitleRomFSPXI(buffer->data, size, offset, &read, &fileSize,
+                                            titleId, media, update);
+        mi.ResizeLastResultBuffer(buffer, R_SUCCEEDED(res) ? read : 0);
+        auto* metadata = mi.ReserveResultBuffer(1, sizeof(fileSize));
+        if (!metadata) return;
+        memcpy(metadata->data, &fileSize, sizeof(fileSize));
+        mi.FinishGood(res);
+    }
+
+    void Title_ReadHomeRomFS(ArticProtocolServer::MethodInterface& mi) {
+        s64 offset;
+        s32 size;
+        if (!mi.GetParameterS64(offset) || !mi.GetParameterS32(size) ||
+            !mi.FinishInputParameters()) return;
+        ReadTitleRomFS(mi, 0x0004003000008202ULL, 0, offset, size);
+    }
+
+    void Title_ReadRomFS(ArticProtocolServer::MethodInterface& mi) {
+        s64 titleId, offset;
+        s8 media;
+        s32 size;
+        if (!mi.GetParameterS64(titleId) || !mi.GetParameterS8(media) ||
+            !mi.GetParameterS64(offset) || !mi.GetParameterS32(size) ||
+            !mi.FinishInputParameters()) return;
+        const u32 category = static_cast<u64>(titleId) >> 32;
+        if (media < 0 || media > 2 || (category != 0x00040000 &&
+            category != 0x00040010 && category != 0x00040030)) {
+            mi.FinishInternalError();
+            return;
+        }
+        ReadTitleRomFS(mi, static_cast<u64>(titleId), static_cast<u8>(media), offset, size);
+    }
+
+    void Title_ReadUpdateRomFS(ArticProtocolServer::MethodInterface& mi) {
+        s64 titleId, offset;
+        s8 media;
+        s32 size;
+        if (!mi.GetParameterS64(titleId) || !mi.GetParameterS8(media) ||
+            !mi.GetParameterS64(offset) || !mi.GetParameterS32(size) ||
+            !mi.FinishInputParameters()) return;
+        const u32 category = static_cast<u64>(titleId) >> 32;
+        if (media < 0 || media > 2 || (category != 0x00040000 &&
+            category != 0x00040010 && category != 0x00040030)) {
+            mi.FinishInternalError();
+            return;
+        }
+        if (category != 0x00040000) { mi.FinishInternalError(); return; }
+        const u64 updateId = (static_cast<u64>(titleId) & 0xFFFFFFFFULL) | 0x0004000E00000000ULL;
+        ReadTitleRomFS(mi, updateId, MEDIATYPE_SD, offset, size);
+    }
+
+    void Title_ProbePXIRomFS(ArticProtocolServer::MethodInterface& mi) {
+        if (!mi.FinishInputParameters()) return;
+        auto* buffer = mi.ReserveResultBuffer(0, sizeof(PxiRomFSReport));
+        if (!buffer) return;
+        CTRPluginFramework::Lock lock(loaderMutex);
+        ProbePxiRomFS(reinterpret_cast<PxiRomFSReport*>(buffer->data));
+        auto* registered = mi.ReserveResultBuffer(1, sizeof(PxiRomFSReport));
+        if (!registered) return;
+        LOADER_ProbeTitleRomFSPXI(reinterpret_cast<PxiRomFSReport*>(registered->data),
+                                0x0004003000008202ULL, 0);
+        mi.FinishGood(0);
+    }
+
+    void Title_ProbeRomFS(ArticProtocolServer::MethodInterface& mi) {
+        s64 titleId;
+        s8 mediaType;
+        if (!mi.GetParameterS64(titleId) || !mi.GetParameterS8(mediaType) ||
+            !mi.FinishInputParameters()) return;
+        if (mediaType != 0 || static_cast<u64>(titleId) != 0x0004003000008202ULL) {
+            mi.FinishInternalError();
+            return;
+        }
+        auto* buffer = mi.ReserveResultBuffer(0, sizeof(u64));
+        if (!buffer) return;
+        CTRPluginFramework::Lock lock(loaderMutex);
+        Result res = LOADER_ProbeTitleRomFS(reinterpret_cast<u64*>(buffer->data),
+                                           static_cast<u64>(titleId), mediaType);
+        if (R_FAILED(res)) mi.ResizeLastResultBuffer(buffer, 0);
+        mi.FinishGood(res);
+    }
+
+    void Title_GetExheader(ArticProtocolServer::MethodInterface& mi) {
+        s64 titleId;
+        s8 mediaType;
+        if (!mi.GetParameterS64(titleId) || !mi.GetParameterS8(mediaType) ||
+            !mi.FinishInputParameters()) return;
+        const u32 category = static_cast<u64>(titleId) >> 32;
+        if (mediaType < 0 || mediaType > 2 ||
+            (category != 0x00040000 && category != 0x00040010 && category != 0x00040030)) {
+            mi.FinishInternalError();
+            return;
+        }
+        auto* buffer = mi.ReserveResultBuffer(0, sizeof(ExHeader_Info));
+        if (!buffer) return;
+        CTRPluginFramework::Lock lock(loaderMutex);
+        Result res = LOADER_GetTitleProgramInfo(
+            reinterpret_cast<ExHeader_Info*>(buffer->data), static_cast<u64>(titleId), mediaType);
+        if (R_FAILED(res)) mi.ResizeLastResultBuffer(buffer, 0);
+        mi.FinishGood(res);
+    }
 
     void Process_GetTitleID(ArticProtocolServer::MethodInterface& mi) {
         bool good = true;
@@ -1158,6 +1373,47 @@ namespace ArticFunctions {
         mi.FinishGood(res);
     }
 
+    void AM_GetTicketCount_(ArticProtocolServer::MethodInterface& mi) {
+        if (!mi.FinishInputParameters()) return;
+        CTRPluginFramework::Lock l(amMutex);
+        Result res = amInit();
+        if (R_FAILED(res)) { mi.FinishGood(res); return; }
+        u32 count = 0;
+        res = AM_GetTicketCount(&count);
+        amExit();
+        if (R_FAILED(res)) { mi.FinishGood(res); return; }
+        auto* buffer = mi.ReserveResultBuffer(0, sizeof(count));
+        if (!buffer) return;
+        memcpy(buffer->data, &count, sizeof(count));
+        mi.FinishGood(res);
+    }
+
+    void AM_GetTicketList_(ArticProtocolServer::MethodInterface& mi) {
+        s32 count, index;
+        if (!mi.GetParameterS32(count) || !mi.GetParameterS32(index) ||
+            !mi.FinishInputParameters()) return;
+        if (count < 0 || count > 8192 || index < 0) {
+            mi.FinishGood(static_cast<Result>(0xE0E046C1));
+            return;
+        }
+        auto* buffer = mi.ReserveResultBuffer(0, static_cast<size_t>(count) * sizeof(u64));
+        if (!buffer) return;
+        CTRPluginFramework::Lock l(amMutex);
+        Result res = amInit();
+        u32 written = 0;
+        if (R_SUCCEEDED(res)) {
+            res = AM_GetTicketList(&written, count, index, reinterpret_cast<u64*>(buffer->data));
+            amExit();
+        }
+        if (R_FAILED(res)) written = 0;
+        if (written > static_cast<u32>(count)) {
+            written = 0;
+            res = static_cast<Result>(0xE0E046C1);
+        }
+        mi.ResizeLastResultBuffer(buffer, static_cast<size_t>(written) * sizeof(u64));
+        mi.FinishGood(res);
+    }
+
     void AM_GetTitleCount_(ArticProtocolServer::MethodInterface& mi) {
         bool good = true;
         s8 mediatype;
@@ -1456,7 +1712,7 @@ namespace ArticFunctions {
 
         if (!good) return;
 
-        ArticProtocolCommon::Buffer* content_buf = mi.ReserveResultBuffer(0, count * sizeof(AM_TicketInfo));
+        ArticProtocolCommon::Buffer* content_buf = mi.ReserveResultBuffer(0, count * sizeof(ArticTicketInfo));
         if (!content_buf) {
             return;
         }
@@ -1470,7 +1726,7 @@ namespace ArticFunctions {
         }
 
         u32 ticketsRead = 0;
-        res = AMAPP_ListDataTitleTicketInfos(&ticketsRead, title_id, count, start_index, reinterpret_cast<AM_TicketInfo*>(content_buf->data));
+        res = AMAPP_ListDataTitleTicketInfos(&ticketsRead, title_id, count, start_index, reinterpret_cast<ArticTicketInfo*>(content_buf->data));
         amExit();
         if (R_FAILED(res)) {
             mi.ResizeLastResultBuffer(content_buf, 0);
@@ -1478,7 +1734,7 @@ namespace ArticFunctions {
             return;
         }
 
-        mi.ResizeLastResultBuffer(content_buf, sizeof(AM_TicketInfo) * ticketsRead);
+        mi.ResizeLastResultBuffer(content_buf, sizeof(ArticTicketInfo) * ticketsRead);
         mi.FinishGood(res);
     }
 
@@ -1780,6 +2036,16 @@ namespace ArticFunctions {
     }
 
     std::map<std::string, void(*)(ArticProtocolServer::MethodInterface& mi)> functionHandlers = {
+        {METHOD_NAME("Title_GetExheader"), Title_GetExheader},
+        {METHOD_NAME("Title_ProbeRomFS"), Title_ProbeRomFS},
+        {METHOD_NAME("Title_ProbePXIRomFS"), Title_ProbePXIRomFS},
+        {METHOD_NAME("Title_ReadHomeLayout"), Title_ReadHomeLayout},
+        {METHOD_NAME("Title_ReadHomeRomFS"), Title_ReadHomeRomFS},
+        {METHOD_NAME("Title_ReadRomFS"), Title_ReadRomFS},
+        {METHOD_NAME("Title_ReadCode"), Title_ReadCode},
+        {METHOD_NAME("Title_GetCodeSize"), Title_GetCodeSize},
+        {METHOD_NAME("Title_ReadUpdateRomFS"), Title_ReadUpdateRomFS},
+        {METHOD_NAME("Title_ReadCodeChunk"), Title_ReadCodeChunk},
         {METHOD_NAME("Process_GetTitleID"), Process_GetTitleID},
         {METHOD_NAME("Process_GetProductInfo"), Process_GetProductInfo},
         {METHOD_NAME("Process_GetExheader"), Process_GetExheader},
@@ -1823,6 +2089,8 @@ namespace ArticFunctions {
         {METHOD_NAME("FSFILE_Flush"), FSFILE_Flush_},
         {METHOD_NAME("FSDIR_Read"), FSDIR_Read_},
         {METHOD_NAME("FSDIR_Close"), FSDIR_Close_},
+        {METHOD_NAME("AM_GetTicketCount"), AM_GetTicketCount_},
+        {METHOD_NAME("AM_GetTicketList"), AM_GetTicketList_},
         {METHOD_NAME("AM_GetTitleCount"), AM_GetTitleCount_},
         {METHOD_NAME("AM_GetTitleList"), AM_GetTitleList_},
         {METHOD_NAME("AM_GetTitleInfo"), AM_GetTitleInfo_},
@@ -1863,6 +2131,11 @@ namespace ArticFunctions {
     }
 
     static bool closeHandles() {
+        {
+            CTRPluginFramework::Lock lock(loaderMutex);
+            LOADER_CloseRomFSCache();
+            ClearLargeCode();
+        }
         auto CloseHandle = [](u64 handle, HandleType type) {
             switch (type)
             {
@@ -1906,7 +2179,9 @@ namespace ArticFunctions {
     }
 
     std::vector<bool(*)()> setupFunctions {
+#ifndef ARTIC_STANDALONE
         obtainExheader,
+#endif
     };
 
     std::vector<bool(*)()> destructFunctions {
